@@ -11,20 +11,20 @@ pretrained_models_dir = get_pretrained_models_src()
 
 
 def load_model(args):
-    if 'pretrained_model' in args:
+    if 'pretrained_model' in args: #Ian argument includes pretrained model, the NetworkArch will be set based on the pretrain model
         model_args = load_experiment_specifications(os.path.join(pretrained_models_dir,
                                                                       args['pretrained_model']))
         args["NetworkArch"] = model_args["NetworkArch"]
         args["NetworkSpecs"] = model_args["NetworkSpecs"]
 
-    if args['NetworkArch'] == 'GraspDiffusion':
+    if args['NetworkArch'] == 'GraspDiffusion': # normal one
         model = load_grasp_diffusion(args)
-    elif args['NetworkArch'] == 'PointcloudGraspDiffusion':
+    elif args['NetworkArch'] == 'PointcloudGraspDiffusion': # partial point cloud and point cloud
         model = load_pointcloud_grasp_diffusion(args)
 
 
     if 'pretrained_model' in args:
-        model_path = os.path.join(pretrained_models_dir, args['pretrained_model'], 'model.pth')
+        model_path = os.path.join(pretrained_models_dir, args['pretrained_model'], 'model.pth') # find the checkpoint file .pth
 
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
 
@@ -97,11 +97,11 @@ def load_pointcloud_grasp_diffusion(args):
     feat_enc_params = params['feature_encoder']
     v_enc_params = params['encoder']
     points_params = params['points']
-    # vision encoder
+    # vision encoder, object -> shape code
     vision_encoder = models.vision_encoder.VNNPointnet2(out_features=v_enc_params['latent_size'], device=device)
-    # Geometry encoder
+    # Geometry encoder, Grasp pose -> point
     geometry_encoder = models.geometry_encoder.map_projected_points
-    # Feature Encoder
+    # Feature Encoder, F_theta
     feature_encoder = models.nets.TimeLatentFeatureEncoder(
             enc_dim=feat_enc_params['enc_dim'],
             latent_size= v_enc_params['latent_size'],
@@ -123,7 +123,7 @@ def load_pointcloud_grasp_diffusion(args):
                             scale=np.array(points_params['scale']))
     else:
         points = models.points.get_3d_pts(n_points=points_params['n_points'])
-    # Energy Based Model
+    # Energy Based Model, D_theta
     in_dim = points_params['n_points']*feat_enc_params['out_dim']
     hidden_dim = 512
     energy_net = nn.Sequential(

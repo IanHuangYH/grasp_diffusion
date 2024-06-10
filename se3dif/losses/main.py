@@ -7,9 +7,9 @@ def get_losses(args):
 
     loss_fns = {}
     if 'sdf_loss' in losses:
-        loss_fns['sdf'] = SDFLoss().loss_fn
+        loss_fns['sdf'] = SDFLoss().loss_fn # default case of train_partial
     if 'projected_denoising_loss' in losses:
-        loss_fns['denoise'] = ProjectedSE3DenoisingLoss().loss_fn
+        loss_fns['denoise'] = ProjectedSE3DenoisingLoss().loss_fn # default case of train_partial
     if 'denoising_loss' in losses:
         loss_fns['denoise'] = SE3DenoisingLoss().loss_fn
 
