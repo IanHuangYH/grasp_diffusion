@@ -79,7 +79,7 @@ class TimeLatentFeatureEncoder(nn.Module):
             else:
                 out_dim = dims[layer + 1]
                 if self.xyz_in_all and layer != self.num_layers - 2:
-                    out_dim -= 3
+                    out_dim = out_dim - 3
 
             if weight_norm and layer in self.norm_layers:
                 setattr(

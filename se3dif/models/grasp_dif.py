@@ -84,7 +84,7 @@ class GraspDiffusionFields(nn.Module):
         p = self.geometry_encoder(H, self.points)
         k_ext = k.unsqueeze(1).repeat(1, p.shape[1])
         z_ext = self.z.unsqueeze(1).repeat(1, p.shape[1], 1)
-        ## 2. Get Features
+        ## 2. Get Features, size of p, k_ext, z_ext are all the same
         psi = self.feature_encoder(p, k_ext, z_ext)
         ## 3. Flat and get energy
         psi_flatten = psi.reshape(psi.shape[0], -1)

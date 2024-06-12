@@ -120,7 +120,7 @@ def main(opt):
     ## Model
     args['device'] = device
     #Ian add argument for pre-trained model
-    args['pretrained_model'] = 'partial_grasp_dif'
+    #args['pretrained_model'] = 'partial_grasp_dif'
     model = loader.load_model(args)
 
     if 'pretrained_model' not in args: # need training
