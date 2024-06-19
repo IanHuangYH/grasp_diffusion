@@ -21,13 +21,13 @@ class SO3_R3():
     def log_map(self):
         return torch.cat((self.t, self.w), -1)
 
-    def exp_map(self, x):
+    def exp_map(self, x): # reurn SO3_R3
         self.t = x[..., :3]
         self.w = x[..., 3:]
         self.R = SO3().exp_map(self.w)
         return self
 
-    def to_matrix(self):
+    def to_matrix(self): # return 4x4 torch vector
         H = torch.eye(4).unsqueeze(0).repeat(self.t.shape[0], 1, 1).to(self.t)
         H[:, :3, :3] = self.R.to_matrix()
         H[:, :3, -1] = self.t

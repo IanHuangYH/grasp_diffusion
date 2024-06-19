@@ -50,8 +50,8 @@ class ProjectedSE3DenoisingLoss():
         loss_fn = nn.L1Loss()
         loss = loss_fn(grad_energy, z_target)/10.
 
-        info = {self.field: grad_energy}
-        loss_dict = {"Score loss": loss}
+        info = {self.field: grad_energy} 
+        loss_dict = {"Score loss": loss} # dE_theta/dH + Dlogq/dH, see (5)
         return loss_dict, info
 
 
@@ -121,6 +121,7 @@ class SE3DenoisingLoss():
         loss = loss_fn(grad_energy, -target_score)/20.
 
         info = {self.field: energy}
-        loss_dict = {"Score loss": loss}
+        loss_dict = {"Score loss": loss} # dE_theta/dH + Dlogq/dH, see (5)
+
         return loss_dict, info
 

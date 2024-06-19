@@ -15,11 +15,13 @@ from se3dif.utils import to_torch, SO3_R3
 from mesh_to_sdf.scan import ScanPointcloud
 
 import matplotlib.pyplot as plt
+from tqdm.autonotebook import tqdm
+import os
 
-OPT_PROJ_SE3_DENOISE_LOSS = 1
-RAW_DATA_NUM = 4
-EXPAND_SCALE = 100
-BATCH_SIZE = 1
+from matplotlib.patches import FancyArrowPatch
+from mpl_toolkits.mplot3d.proj3d import proj_transform
+#from mpl_toolkits.mplot3d.axes3d import Axes3D
+from mpl_toolkits.mplot3d import Axes3D
 
 def GetTrainData(nTrainDataNum: int) -> torch.Tensor:
     # R_z: along (0,0,1) rotate pi/4, pi*3/4, pi*5/4, pi*7/4 R^6 data
@@ -113,14 +115,17 @@ def sample_pointcloud(obj_id=0, obj_class='Mug'):
 
     return P, mesh
 
-def PutShapeCodeMaskIntoModel(device, model):
+def GenerateShapeCodeMask(device):
     args_sample = parse_Sample_args()
     obj_id = int(args_sample.obj_id)
     obj_class = args_sample.obj_class
     P, mesh = sample_pointcloud(obj_id, obj_class)
     context = to_torch(P[None,...], device)
-    model.set_latent(context, batch=EXPAND_SCALE * BATCH_SIZE)
+    #model.set_latent(context, batch=EXPAND_SCALE * BATCH_SIZE)
     return context
+
+def marginal_prob_std_np(t, sigma=0.5):
+        return np.sqrt((sigma ** (2 * t) - 1.) / (2. * np.log(sigma)))
 
 class SimpleGraspTrainer():
     def __init__(self, device) -> None:
@@ -146,14 +151,15 @@ class SimpleGraspTrainer():
     def marginal_prob_std(self, t, sigma=0.5):
         return torch.sqrt((sigma ** (2 * t) - 1.) / (2. * np.log(sigma)))
     
-    def __PerturbHData(self, Data:torch.tensor, ExpandNum: int, eps=1e-5) -> torch.tensor:
+    def __PerturbHData(self, Data:torch.tensor, ExpandNum: int, context, eps=1e-5) -> torch.tensor:
         '''Data: H with 4x4 tensor'''
+        # !!! must add, or torch cannot teack the gradient
+        model.set_latent(context, batch=EXPAND_SCALE * BATCH_SIZE)
 
         ## 1. expand H ##
         HSingle = SO3_R3(R=Data[...,:3, :3], t=Data[...,:3, -1])
         Matrix_expand_H = HSingle.to_matrix().repeat(ExpandNum,1,1)
         H_expand = SO3_R3(R=Matrix_expand_H[...,:3, :3], t=Matrix_expand_H[...,:3, -1])
-        # H_expand = SO3_R3(R=Data[...,:3, :3], t=Data[...,:3, -1])
         
         ## 2. H to vector ##
         VecCleanH = H_expand.log_map()
@@ -165,13 +171,15 @@ class SimpleGraspTrainer():
         VecPerturbed_H = VecCleanH + VecNoise * std[..., None]
         VecPerturbed_H = VecPerturbed_H.detach()
         VecPerturbed_H.requires_grad_(True)
-        Matrix_PerturbData = SO3_R3().exp_map(VecPerturbed_H).to_matrix()
+
+        with torch.set_grad_enabled(True):
+            Matrix_PerturbData = SO3_R3().exp_map(VecPerturbed_H).to_matrix()
 
         ## 4. normalize generate noise
         NormalNoise = VecNoise/std[...,None]
 
 
-        return Matrix_PerturbData.clone(), NormalNoise.clone(), random_t_step.clone(), VecPerturbed_H.clone()
+        return Matrix_PerturbData, NormalNoise, random_t_step, VecPerturbed_H
     
     def __CalculateLoss(self, option:int, model, 
                       random_t_step: torch.tensor, NormalNoise:torch.tensor, 
@@ -182,49 +190,187 @@ class SimpleGraspTrainer():
             grad_energy = torch.autograd.grad(energy.sum(), VecPerturbed_H,
                                             only_inputs=True, retain_graph=True, create_graph=True)[0]
         loss_fn = torch.nn.L1Loss()
-        Loss = loss_fn(grad_energy, NormalNoise)/10.
-            
-        return Loss
+        loss = loss_fn(grad_energy, NormalNoise)/10.
 
-    def train(self, model, TrainDataLoader: DataLoader):
+        info = {'E_theta': grad_energy}
+        loss_dict = {"Log_q": loss}
+            
+        return loss_dict, info
+    
+    def loss_fn_ian(self, model, Data:torch.tensor, ExpandNum, context, eps=1e-5):
+        model.set_latent(context, batch=EXPAND_SCALE * BATCH_SIZE)
+        ## 1. expand H ##
+        HSingle = SO3_R3(R=Data[...,:3, :3], t=Data[...,:3, -1])
+        Matrix_expand_H = HSingle.to_matrix().repeat(ExpandNum,1,1)
+        H_expand = SO3_R3(R=Matrix_expand_H[...,:3, :3], t=Matrix_expand_H[...,:3, -1])
+        # Data : torch.tensor = Data.reshape(-1, 4, 4)
+        # H_expand : SO3_R3 = SO3_R3(R=Data[...,:3, :3], t=Data[...,:3, -1])
+        
+        ## 2. H to vector ##
+        VecCleanH : torch.tensor = H_expand.log_map()
+        
+        ## 3. generate noise
+        random_t_step : torch.tensor = torch.rand_like(VecCleanH[...,0], device=self.m_device) * (1. - eps) + eps
+        VecNoise : torch.tensor = torch.randn_like(VecCleanH)
+        std = self.marginal_prob_std(random_t_step)
+        VecPerturbed_H : torch.tensor = VecCleanH + VecNoise * std[..., None]
+        VecPerturbed_H = VecPerturbed_H.detach()
+        VecPerturbed_H.requires_grad_(True)
+
+        with torch.set_grad_enabled(True):
+            Matrix_PerturbData = SO3_R3().exp_map(VecPerturbed_H).to_matrix()
+            energy = model(Matrix_PerturbData, random_t_step)
+            grad_energy = torch.autograd.grad(energy.sum(), VecPerturbed_H,
+                                            only_inputs=True, retain_graph=True, create_graph=True)[0]
+
+
+        # 4. normalize generate noise
+        NormalNoise = VecNoise/std[...,None]
+        loss_fn = torch.nn.L1Loss()
+        loss = loss_fn(grad_energy, NormalNoise)/10.
+
+        info = {'denoise': grad_energy}
+        loss_dict = {"Score loss": loss}
+        return loss_dict, info
+
+    def train(self, model, TrainDataLoader: DataLoader, context, MODEL_LOAD_PATH:str):
         optimizer = [self.__SetOptimizer()]
-        Train_Iter = 1000
+        Train_Iter = TRAIN_EPOCH
         loss_trj = torch.zeros(0)
 
-        
-        for Iter in range(Train_Iter):
+        with tqdm(total=len(TrainDataLoader) * Train_Iter) as pbar:
+            train_losses_save = []
             for idx_Data, CleanHData in enumerate(TrainDataLoader):
-                train_loss = 0.
-
-                # Enable anomaly detection
-                with torch.autograd.detect_anomaly(True):
+                for Iter in range(Train_Iter): 
+                
+                    # losses, iter_info = self.loss_fn_ian(model, CleanHData, EXPAND_SCALE, context)
                     # forward process
-                    Matrix_PerturbData, NormalNoise, random_t_step, VecPerturbed_H = self.__PerturbHData(CleanHData, EXPAND_SCALE)
+                    Matrix_PerturbData, NormalNoise, random_t_step, VecPerturbed_H = self.__PerturbHData(CleanHData, EXPAND_SCALE, context)
                     
                     # predict and compare with ground truth
-                    loss = self.__CalculateLoss(OPT_PROJ_SE3_DENOISE_LOSS, model,
-                                        random_t_step, NormalNoise, 
-                                        Matrix_PerturbData, VecPerturbed_H)
-                    train_loss = train_loss + loss
+                    losses, iter_info = self.__CalculateLoss(OPT_PROJ_SE3_DENOISE_LOSS, model,
+                                                            random_t_step, NormalNoise, 
+                                                            Matrix_PerturbData, VecPerturbed_H)
                     
+                    train_loss = 0.
+
+                    for loss_name, loss in losses.items():
+                        single_loss = loss.mean()
+                        train_loss += single_loss
+                    
+                    train_losses_save.append(train_loss.item())
                     # record loss in each epoch
-                    #loss_trj = torch.cat((loss_trj, Loss.mean().detach()[None]), dim=0)
+                    loss_trj = torch.cat((loss_trj, train_loss.detach()[None]), dim=0)
 
                     # clear gradient
                     for optim in optimizer:
                         optim.zero_grad()
 
                     # Backward pass calculate gradient
-                    train_loss.backward(retain_graph=True)
+                    train_loss.backward()
 
                     # optimization by gradient
                     for optim in optimizer:
                         optim.step()
 
+                    pbar.update(1)
+        
+        torch.save(model.state_dict(),
+                   os.path.join(MODEL_LOAD_PATH, 'model_ian_tutorial.pth'))
+        np.savetxt(os.path.join(MODEL_LOAD_PATH, 'train_losses_ian_tutorial.txt'),
+                   np.array(train_losses_save))            
+
         #plt.plot(loss_trj)
         #plt.show()
 
-## 1. Dataset #####################################################################
+def LangevinSampleStep(H0_nosie: torch.tensor, model, device, TotalStep:int):
+    eps = 1e-3
+    alpha = 1e-3
+    VecH0 = SO3_R3(R=H0_nosie[..., :3, :3] , t=H0_nosie[..., :3, -1]).log_map()
+    H_traj = []
+    for t in range(TotalStep):
+        ## coefficient
+        k = ((TotalStep - t)/TotalStep) + eps
+        sigma_T = marginal_prob_std_np(eps)
+        sigma_i = marginal_prob_std_np(k)
+        ratio = sigma_i/sigma_T
+        c_lr = alpha*ratio**2 #alpha_k^2 in (7)
+
+        ## 1. add random noise in sample
+        noise = torch.randn_like(VecH0)
+        noise = np.sqrt(c_lr)*noise
+        VecH0_AddNoise = VecH0 + np.sqrt(alpha)*ratio*noise
+
+
+        ## 2. Compute gradient ##
+        InputStep = k*torch.ones_like(VecH0_AddNoise[...,0])
+        VecH0_AddNoise = VecH0_AddNoise.detach().requires_grad_(True)
+        H0_AddNoise = SO3_R3().exp_map(VecH0_AddNoise).to_matrix()
+        energy = model(H0_AddNoise, InputStep)
+        grad_energy = torch.autograd.grad(energy.sum(), VecH0_AddNoise, only_inputs=True)[0]
+
+        ## 3. Evolve gradient ##
+        delta_x = -.5*c_lr*grad_energy
+        VecUpdate = VecH0_AddNoise + delta_x
+
+        ## Build H for output##
+        H_update : SO3_R3 = SO3_R3().exp_map(VecUpdate).to_matrix().reshape(4,4)
+        H_traj.append(H_update)
+
+        ## Update ##
+        VecH0 = VecUpdate
+    return VecUpdate, H_update, H_traj
+        
+class GraspingDrawer():
+    def __init__(self) -> None:
+        self.m_arrowLength = 0.1
+        self.fig2D = plt.figure()
+        self.ax2D = self.fig2D.gca()
+        self.fig3D = plt.figure()
+        self.ax3D = self.fig3D.gca(projection='3d')
+        
+
+
+    def DrawSingleH(self, H:torch.tensor, in_color='b') -> None:
+        # basePt = np.array([H[0][3]], [H[1][3]], [H[2][3]])
+        # baseVec = np.array([self.m_arrowLength], [0], [0])
+        basePt : np.array = H[:3, -1].detach().numpy().reshape(3,1)
+        baseVec : np.array = np.array([[self.m_arrowLength], [0.], [0.]])
+        RotateMat : np.array = H[:3, :3].detach().numpy().reshape(3,3)
+        RotateVec = np.matmul(RotateMat, baseVec)
+
+        TarPt = basePt + RotateVec
+        PtX, PtY, PtZ = [basePt[0][0], TarPt[0][0]], [basePt[1][0], TarPt[1][0]], [basePt[2][0], TarPt[2][0]]
+        #plt.plot(PtX, PtY, PtZ, marker = 'o', color=in_color)
+        self.ax2D.plot(PtX, PtY, marker = 'o', color=in_color)
+        self.ax3D.plot(PtX, PtY, PtZ, marker = 'o', color=in_color)
+        plt.show()
+        
+
+    def DrawDataSet(self, HDataSet: torch.tensor, in_color='b')-> None:
+        for H in HDataSet:
+            self.DrawSingleH(H, in_color)
+##########################################################################################################
+## 0. Basic setting ###############################################################
+#argument for training
+OPT_PROJ_SE3_DENOISE_LOSS = 1
+RAW_DATA_NUM = 4
+EXPAND_SCALE = 400
+TRAIN_EPOCH = 1000
+BATCH_SIZE = 1
+
+#argument for sampling
+PRE_TRAIN_MODEL = 1
+device = torch.device('cpu')
+MODEL_LOAD_PATH = '/code/result/'
+PRE_TRAIN_MODEL_NAME = 'model_ian_tutorial.pth'
+SAMPLE_NUM = 1
+SAMPLE_STEP = 500
+
+
+
+
+# 1. Dataset #####################################################################
 nTrainDataNum = RAW_DATA_NUM
 RotTheta_data, TransData, HData = GetTrainData(nTrainDataNum)
 
@@ -237,10 +383,46 @@ args_train = SetArgOfTrainModel()
 model = load_pointcloud_grasp_diffusion(args_train)
 
 ## 3. train model (Forward process and learn denoise) #############################
-device = torch.device('cpu')
-context = PutShapeCodeMaskIntoModel(device, model)
-Trainer = SimpleGraspTrainer(device)
-Trainer.train(model, Train_dataloader)
+context = GenerateShapeCodeMask(device)
+if PRE_TRAIN_MODEL == 0: # train own model
+    Trainer = SimpleGraspTrainer(device)
+    Trainer.train(model, Train_dataloader, context, MODEL_LOAD_PATH)
+elif PRE_TRAIN_MODEL == 1: # use checkpoint
+    model_path = os.path.join(MODEL_LOAD_PATH, PRE_TRAIN_MODEL_NAME) # find the checkpoint file .pth
+    model.load_state_dict(torch.load(model_path, map_location=device))
+else: # wrong
+    print("Wrong Flag!")
 
 
-## 4. sample based on trained model ###############################################
+## 4. sample based on trained model ##################################################
+model.set_latent(context, batch=SAMPLE_NUM * BATCH_SIZE)
+# random gaussian H
+H0_nosie = SO3_R3().sample(SAMPLE_NUM).to(device, torch.float32) # SAMPLE_NUM x 4 x 4 
+# R0_noise : torch.tensor = SO3.rand(SAMPLE_NUM).to_matrix() 
+# x0_noise : torch.tensor = torch.randn(SAMPLE_NUM, 3) # SAMPLE_NUM x 3
+VecFinal, H_Final, H_traj = LangevinSampleStep(H0_nosie, model, device, SAMPLE_STEP)
+
+## 5. plot ###########################################################################
+Drawer = GraspingDrawer()
+Drawer.DrawDataSet(HData)
+Drawer.DrawDataSet(H_traj,'r')
+#Drawer.DrawSingleH(H_Final,'r')
+print("finish")
+
+# fig = plt.figure()
+# ax = fig.gca(projection='3d')
+
+# # Make the grid
+# x, y, z = np.meshgrid(np.arange(-0.8, 1, 0.2),
+#                       np.arange(-0.8, 1, 0.2),
+#                       np.arange(-0.8, 1, 0.8))
+
+# # Make the direction data for the arrows
+# u = np.sin(np.pi * x) * np.cos(np.pi * y) * np.cos(np.pi * z)
+# v = -np.cos(np.pi * x) * np.sin(np.pi * y) * np.cos(np.pi * z)
+# w = (np.sqrt(2.0 / 3.0) * np.cos(np.pi * x) * np.cos(np.pi * y) *
+#      np.sin(np.pi * z))
+
+# ax.quiver(0, 0, 0, 1, 1, 0, length=0.1, normalize=True)
+
+# plt.show()
